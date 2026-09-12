@@ -1,15 +1,35 @@
 # CleanRecorder
 
-A no-overlay Android screen recorder: hardware-encoded 1080p60 video, system-audio + mic
-capture/mixing, a live status-bar notification timer, and a Quick Settings tile toggle.
+A no-overlay Android screen recorder: hardware-encoded video up to 4K/240fps (device-capability
+permitting), configurable bitrate, system-audio + mic capture/mixing, a live status-bar
+notification timer, and a Quick Settings tile toggle.
 
-## Build
+## Build & run
 
-Open the `CleanRecorder/` folder in Android Studio (Koala+) and let it sync — it's a
-standard Gradle project (AGP 8.5.2 / Kotlin 1.9.24 / compileSdk & targetSdk 35, minSdk 29).
-No `gradlew` wrapper is included; run **File → Sync Project with Gradle Files** and Android
-Studio will offer to generate the wrapper, or run `gradle wrapper` yourself if you have
-Gradle installed locally.
+This is a normal Android Studio project — there's no separate "compile" step you need to
+run yourself:
+
+1. Open the `CleanRecorder/` folder in Android Studio (Koala+). It'll detect the Gradle
+   project automatically and start syncing (downloading AGP 8.5.2 / Kotlin 1.9.24 and the
+   dependencies in `app/build.gradle.kts`). Let that finish — first sync can take a few minutes.
+2. On your phone: **Settings → About phone → tap "Build number" 7 times** to unlock Developer
+   Options, then **Settings → Developer options → USB debugging → on**.
+3. Plug the phone into your computer with a USB cable. Choose "Allow" / "Always allow from
+   this computer" on the RSA fingerprint prompt that pops up on the phone screen.
+4. In Android Studio, pick your device from the device dropdown in the toolbar (next to the
+   Run button), then click **Run ▶** (or `Shift+F10`).
+
+That last step is the part worth calling out: clicking Run does the whole pipeline for you —
+Gradle compiles the Kotlin sources, packages the APK, signs it with a debug key, pushes it to
+the phone over the USB (ADB) connection, and launches it, all automatically in the background.
+You never touch a raw `.apk` file or run a manual install command; Android Studio's build
+output panel just shows progress and then the app opens on your phone by itself. Any time you
+change code and hit Run again, it rebuilds and reinstalls the same way (usually much faster on
+incremental builds).
+
+No `gradlew` wrapper is checked into the repo — Android Studio will offer to generate one on
+first sync, or run `gradle wrapper` yourself if you have Gradle installed locally and prefer
+building from a terminal.
 
 minSdk is 29 (Android 10) because `AudioPlaybackCaptureConfiguration` — the API that makes
 system-audio capture possible at all — doesn't exist before it.
@@ -57,8 +77,23 @@ the closest real equivalent instead of inventing calls that won't compile:
 - **`ProjectionRequestActivity`** — an invisible trampoline: a `TileService` can't itself
   register for an `ActivityResult`, so this activity requests MediaProjection consent on the
   tile's behalf and starts the service.
-- **`MainActivity`** — Compose UI: audio-source picker, live elapsed-time card, single record
-  button, runtime permission handling (`RECORD_AUDIO`, `POST_NOTIFICATIONS`).
+- **`MainActivity`** — Compose UI: audio-source picker, resolution/frame-rate/bitrate preset
+  selectors, live elapsed-time card, single record button, runtime permission handling
+  (`RECORD_AUDIO`, `POST_NOTIFICATIONS`).
+- **`ResolutionPreset` / `FrameRatePreset` / `BitratePreset`** (`RecordingConfig.kt`) — the
+  selectable presets: 360p→4K, 30→240fps, 6→60 Mbps. Resolution presets are a target "long
+  edge"; the actual capture width/height is derived by matching the device's real aspect
+  ratio (see `RecordService.computeCaptureGeometry`), and upscaling is allowed on purpose
+  (e.g. a 1080p-native phone requesting 4K) — same mechanism system display-mirroring/casting
+  uses to render into a larger virtual surface.
+- **`VideoEncoder.resolveSupportedConfig`** — before configuring the encoder, queries the
+  device's actual `MediaCodecInfo.VideoCapabilities` and clamps the requested resolution/fps/
+  bitrate down to whatever the hardware really supports, since `MediaCodec.configure()` throws
+  outright on an unsupported combination instead of degrading gracefully. The clamped values
+  (plus *why* they were clamped) flow back into `RecordingState` so the UI can show what's
+  actually recording, not just what was requested.
+- **`Prefs`** — persists the last-chosen audio mode + resolution + fps + bitrate so a
+  Quick Settings tile-triggered recording uses the same settings you last picked in-app.
 
 ## Output
 
@@ -67,9 +102,17 @@ Files are written via `MediaStore` (scoped storage) to `DCIM/CleanRecorder/`, us
 
 ## Known trade-offs worth knowing about
 
-- Capture resolution is computed from the device's real display metrics, capped at 1920px on
-  the long edge (not upscaled if the panel is smaller) — this is what "1080x1920 or scaled
-  match to aspect ratio" meant in practice for non-1080p-native devices (foldables, tablets).
+- Resolution presets (360p–4K) and fps presets (30–240) are requests, not guarantees — see
+  `VideoEncoder.resolveSupportedConfig` above. A phone's hardware AVC encoder frequently can't
+  actually do 4K@240 (few chipsets can), so it gets clamped to the nearest supported combo and
+  `RecordingState.appliedVideoConfig` reflects the real values in use.
+- Separately, a `VirtualDisplay` only receives new frames as fast as the source compositor
+  produces them, which is capped by the phone's actual panel refresh rate (commonly 60/90/120Hz)
+  regardless of what the encoder is configured for. Selecting 240fps on a 60Hz phone won't
+  crash anything or corrupt the file — MediaCodec handles the real, lower arrival cadence fine
+  via genuine presentation timestamps — it just means the effective captured fps will quietly
+  be lower than what was selected. `RecordService` surfaces this as an advisory log line
+  rather than silently pretending the number is real.
 - If system-audio capture fails to initialize (some OEM skins restrict it further than AOSP),
   the service automatically falls back to video-only rather than failing the whole recording —
   `RecordingState.audioMode` reflects the *effective* mode, not just the requested one.
